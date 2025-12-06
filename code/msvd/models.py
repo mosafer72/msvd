@@ -32,23 +32,20 @@ class ReverseLayerF(Function):
         output = grad_output.neg() * ctx.alpha
         return output, None
 
-
 class MDiscriminator(nn.Module):
-    def __init__(self, num_domain=1, input_dim=768, hidden_dim=768):
+    def __init__(self, num_domain=1, input_dim=256, hidden_dim=256):
         super(MDiscriminator, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        layers = [
+        self.layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_domain + 1)
-        ]
-        self.layers = torch.nn.Sequential(*layers)
+            nn.Linear(hidden_dim, num_domain)  # قبلاً +1 اضافه بود که اشتباه بود
+        )
 
     def forward(self, x):
         return self.layers(x)
+
 
 
 class MAdversarialLoss(nn.Module):
@@ -57,7 +54,7 @@ class MAdversarialLoss(nn.Module):
     '''
 
     def __init__(self, gamma=1.0, max_iter=1000, num_domain=1, use_lambda_scheduler=True):
-        super(MAdversarialLossM, self).__init__()
+        super(MAdversarialLoss, self).__init__()
         self.domain_classifier = MDiscriminator(num_domain=num_domain)
         self.use_lambda_scheduler = use_lambda_scheduler
         if self.use_lambda_scheduler:
@@ -116,7 +113,7 @@ class MSVD(nn.Module):
         transfer_losses = []
         for i in range(self.num_domain):
             transfer_losses.append(self.adapt_loss(source_features[i], i))
-        transfer_losses.append(self.adapt_loss(target_feature, self.num_domain))
+        transfer_losses.append(self.adapt_loss(target_feature, self.num_domain-1))
         return torch.stack(clf_losses), torch.stack(transfer_losses)
 
     def get_parameters(self, args, lr):
