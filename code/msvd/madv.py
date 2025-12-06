@@ -1,3 +1,4 @@
+# ======================= madv.py (FIXED & CLEAN VERSION) =======================
 from __future__ import absolute_import, division, print_function
 import argparse
 import logging
@@ -6,7 +7,7 @@ import random
 import math
 import numpy as np
 import torch
-from transformers import (get_linear_schedule_with_warmup, RobertaTokenizer)
+from transformers import RobertaTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import models
 import utils
@@ -17,31 +18,38 @@ from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_sc
 logger = logging.getLogger(__name__)
 
 
+# ======================= Dataset Loader =======================
 def load_dataset(tokenizer, file_path, args):
     data_dir = args.data_dir
-    print(file_path)
-    examples = []
-    inputs = []
     df = pd.read_csv(os.path.join(data_dir, file_path))
+
     funcs = df["func"].tolist()
     labels = df["target"].tolist()
-    for i in tqdm(range(len(funcs))):
-        source_tokens, source_ids = convert_examples_to_features(funcs[i], tokenizer, args)
-        examples.append(source_tokens)
-        inputs.append(source_ids)
-    return np.array(inputs), np.array(labels)
+
+    inputs, classes = [], []
+
+    for func, label in tqdm(zip(funcs, labels), total=len(funcs)):
+        tokens, ids = convert_examples_to_features(func, tokenizer, args)
+        inputs.append(ids)
+        classes.append(label)
+
+    return np.array(inputs), np.array(classes)
 
 
-def convert_examples_to_features(func, tokenizer, args):
-    # source
-    code_tokens = tokenizer.tokenize(str(func))[:args.block_size - 2]
+def convert_examples_to_features(code, tokenizer, args):
+
+    code_tokens = tokenizer.tokenize(str(code))[:args.block_size - 2]
+
     source_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
     source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
+
     padding_length = args.block_size - len(source_ids)
     source_ids += [tokenizer.pad_token_id] * padding_length
+
     return source_tokens, source_ids
 
 
+# ======================= Seed =======================
 def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -50,286 +58,252 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
+# ======================= Training =======================
 def train(model, tokenizer, args):
-    """ Train the model """
-    # load data (source train, target train, target test)
-    source_list = args.source_train_file_list
-    source_train_inputs = []
-    source_train_labels = []
-    input_size = []
-    for source_file in source_list:
-        inputs, labels = load_dataset(tokenizer, source_file, args)
-        source_train_inputs.append(inputs)
-        source_train_labels.append(labels)
-        input_size.append(len(inputs))
+
+    source_files = args.source_train_file_list
+    valid_files = args.source_valid_file_list
+
+    source_inputs, source_labels = [], []
+    source_sizes = []
+
+    # Load Source Domains
+    for sf in source_files:
+        x, y = load_dataset(tokenizer, sf, args)
+        source_inputs.append(x)
+        source_labels.append(y)
+        source_sizes.append(len(x))
+
+    # Load Target Train
     target_train_inputs, _ = load_dataset(tokenizer, args.target_train_file, args)
 
-    valid_list = args.source_valid_file_list
-    valid_inputs = []
-    valid_tests = []
-    for valid_file in valid_list:
-        inputs, labels = load_dataset(tokenizer, valid_file, args)
-        valid_inputs.append(inputs)
-        valid_tests.append(labels)
+    # Load Validation Domains (as target test)
+    valid_inputs, valid_labels = [], []
+    for vf in valid_files:
+        vx, vy = load_dataset(tokenizer, vf, args)
+        valid_inputs.append(vx)
+        valid_labels.append(vy)
+
     target_test_inputs = np.concatenate(valid_inputs)
-    target_test_labels = np.concatenate(valid_tests)
+    target_test_labels = np.concatenate(valid_labels)
 
-    # target_test_inputs, target_test_labels = load_dataset(tokenizer, args.target_test_file, args)
-    input_size.append(len(target_train_inputs))
-
-    # Prepare optimizer and schedule (linear warmup and decay)
-    n_batch = int(min(input_size) / args.train_batch_size)
+    # Prepare Training Steps
+    n_batch = int(min(source_sizes) / args.train_batch_size)
     args.max_steps = args.epochs * n_batch
     args.warmup_steps = args.max_steps // 20
-    optimizer_grouped_parameters = model.get_parameters(args, lr=args.learning_rate)
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-                                                num_training_steps=args.max_steps)
 
-    # Train!
+    optimizer = torch.optim.AdamW(model.get_parameters(args, lr=args.learning_rate),
+                                  lr=args.learning_rate, eps=args.adam_epsilon)
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.max_steps
+    )
+
+    # Logging
     number_domain = args.number_domain
-    logger.info("***** Running training *****")
+    logger.info("***** TRAINING *****")
     for i in range(number_domain):
-        source_file_name = os.path.basename(source_list[i])
-        logger.info("  Num examples of %s source data = %d", source_file_name, len(source_train_inputs[i]))
-    logger.info("  Num examples of target data = %d", len(target_train_inputs))
-    logger.info("  Num Epochs = %d", args.epochs)
-    logger.info("  Instantaneous batch size = %d", args.train_batch_size)
-    logger.info("  Total optimization steps = %d", args.max_steps)
+        logger.info(f"Source Domain {i+1}: {len(source_inputs[i])} samples")
+    logger.info(f"Target Train Samples: {len(target_train_inputs)}")
+    logger.info(f"Epochs: {args.epochs}")
 
     best_f1 = 0
     model.to(args.device)
-    model.zero_grad()
-    stop = 0
-    mu = args.transfer_loss_weight
-    clf_loss_log = []
-    transfer_loss_log = []
-    for i in range(number_domain):
-        clf_loss_log.append([])
-        transfer_loss_log.append([])
-    total_loss_log = []
-    for idx in range(args.epochs):
+
+    # ======================= Epoch Loop =======================
+    stop_counter = 0
+
+    for epoch in range(args.epochs):
+
         model.train()
-        train_loss_clf = []
-        train_loss_transfer = []
-        for i in range(number_domain):
-            train_loss_clf.append(utils.AverageMeter())
-            train_loss_transfer.append(utils.AverageMeter())
-        train_loss_total = utils.AverageMeter()
-        # model.epoch_based_processing(n_batch)
+        loss_meter = utils.AverageMeter()
 
-        train_loader = multi_data_loader_st(source_train_inputs, source_train_labels, target_train_inputs, n_batch, args.train_batch_size)
-        for sinputs, slabels, tinput in tqdm(train_loader, desc=f"batch", total=n_batch):
-            for i in range(number_domain):
-                sinputs[i] = torch.tensor(sinputs[i]).to(args.device)
-                slabels[i] = torch.tensor(slabels[i]).to(args.device)
-            tinput = torch.tensor(tinput).to(args.device)
+        train_loader = multi_data_loader_st(
+            source_inputs, source_labels, target_train_inputs,
+            n_batch, args.train_batch_size
+        )
 
-            clf_losses, transfer_losses = model(sinputs, tinput, slabels)
-            loss = torch.mean(clf_losses) + mu * torch.mean(transfer_losses)
+        for sinputs, slabels, tinputs in tqdm(train_loader, desc=f"Epoch {epoch+1}", total=n_batch):
+            sinputs = [torch.tensor(si).to(args.device) for si in sinputs]
+            slabels = [torch.tensor(sl).to(args.device) for sl in slabels]
+            tinputs = torch.tensor(tinputs).to(args.device)
+
+            clf_losses, transfer_losses = model(sinputs, tinputs, slabels)
+            loss = torch.mean(clf_losses) + args.transfer_loss_weight * torch.mean(transfer_losses)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if scheduler:
-                scheduler.step()
+            scheduler.step()
 
-            for i in range(number_domain):
-                train_loss_clf[i].update(clf_losses[i].item())
-                train_loss_transfer[i].update(transfer_losses[i].item())
-                clf_loss_log[i].append(clf_losses[i].item())
-                transfer_loss_log[i].append(transfer_losses[i].item())
-            train_loss_total.update(loss.item())
-            total_loss_log.append(loss.item())
+            loss_meter.update(loss.item())
 
-        info = 'Epoch: [{:2d}/{}], total_Loss: {:.4f}'.format(idx+1, args.epochs, train_loss_total.avg)
-        for i in range(number_domain):
-            info += ', domain {}: clf_loss: {:.4f}, transfer_loss: {:.4f}'.format(i+1, train_loss_clf[i].avg, train_loss_transfer[i].avg)
+        logger.info(f"Epoch {epoch+1}/{args.epochs} | Loss: {loss_meter.avg:.4f}")
 
-        # Valid
-        stop += 1
+        # Evaluate
         result = test(args, model, target_test_inputs, target_test_labels)
-        info += ', test_loss {:4f}, test_f1: {:.4f}'.format(result["test_loss"], result["test_f1"])
+        f1 = result["test_f1"]
 
-        if best_f1 < result["test_f1"]:
-            best_f1 = result["test_f1"]
-            logger.info("  " + "*" * 20)
-            logger.info("  Best f1:%s", round(best_f1, 4))
-            logger.info("  " + "*" * 20)
+        if f1 > best_f1:
+            best_f1 = f1
+            stop_counter = 0
 
-            checkpoint_prefix = 'checkpoint-best-f1-madv'
-            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-            model_to_save = model.module if hasattr(model, 'module') else model
-            output_dir = os.path.join(output_dir, '{}'.format(args.model_name))
-            torch.save(model_to_save.state_dict(), output_dir)
-            logger.info("Saving model checkpoint to %s", output_dir)
-            stop = 0
-        if 0 < args.early_stop <= stop:
-            print(info)
+            save_path = os.path.join(args.output_dir, "checkpoint-best-f1-madv", args.model_name)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"==> BEST MODEL SAVED: f1={round(best_f1,4)}")
+
+        else:
+            stop_counter += 1
+
+        if stop_counter >= args.early_stop:
+            logger.info("Early stopping triggered.")
             break
-        print(info)
-    print('Transfer result: {:.4f}'.format(best_f1))
+
+    logger.info(f"Final Best F1 = {best_f1:.4f}")
 
 
-def test(args, model, test_inputs, test_labels, best_threshold=0.5):
-    test_data_loader = data_loader(test_inputs, test_labels, args.eval_batch_size, shuffle=False)
-    # Eval!
-    logger.info("***** Running Test *****")
-    logger.info("  Num examples = %d", len(test_inputs))
-    logger.info("  Batch size = %d", args.eval_batch_size)
+# ======================= Testing =======================
+def test(args, model, test_inputs, test_labels):
 
-    model.eval()
-    logits = []
-    y_trues = []
-    test_loss = utils.AverageMeter()
+    loader = data_loader(test_inputs, test_labels, args.eval_batch_size, shuffle=False)
+    logger.info("***** TEST *****")
+
     criterion = torch.nn.CrossEntropyLoss()
-    n_batch = math.ceil(len(test_inputs)/args.eval_batch_size)
-    for tx, ty in tqdm(test_data_loader, desc=f"test batchs", total=n_batch):
-        tx = torch.tensor(tx).to(args.device)
-        ty = torch.tensor(ty).to(args.device)
+    model.eval()
+
+    all_logits, all_true = [], []
+    loss_meter = utils.AverageMeter()
+
+    for batch_x, batch_y in loader:
+        batch_x = torch.tensor(batch_x).to(args.device)
+        batch_y = torch.tensor(batch_y).to(args.device)
+
         with torch.no_grad():
-            clf = model.predict(tx)
-            logit = torch.softmax(clf, dim=-1)
-            loss = criterion(clf, ty)
-            test_loss.update(loss.item())
-            logits.append(logit.cpu().numpy())
-            y_trues.append(ty.cpu().numpy())
-    # calculate scores
-    logits = np.concatenate(logits, 0)
-    y_trues = np.concatenate(y_trues, 0)
-    y_preds = logits[:, 1] > best_threshold
-    acc = accuracy_score(y_trues, y_preds)
-    recall = recall_score(y_trues, y_preds)
-    precision = precision_score(y_trues, y_preds)
-    f1 = f1_score(y_trues, y_preds)
-    rocauc = roc_auc_score(y_trues, logits[:, 1])
+            logits = model.predict(batch_x)
+            loss = criterion(logits, batch_y)
+
+        loss_meter.update(loss.item())
+        all_logits.append(torch.softmax(logits, dim=-1).cpu().numpy())
+        all_true.append(batch_y.cpu().numpy())
+
+    logits = np.concatenate(all_logits)
+    y_true = np.concatenate(all_true)
+    y_pred = logits[:, 1] > 0.5
+
     result = {
-        "test_accuracy": float(acc),
-        "test_recall": float(recall),
-        "test_precision": float(precision),
-        "test_f1": float(f1),
-        "test_auc": float(rocauc),
-        "test_threshold": best_threshold,
-        "test_loss": test_loss.avg
+        "test_accuracy": float(accuracy_score(y_true, y_pred)),
+        "test_recall": float(recall_score(y_true, y_pred)),
+        "test_precision": float(precision_score(y_true, y_pred)),
+        "test_f1": float(f1_score(y_true, y_pred)),
+        "test_auc": float(roc_auc_score(y_true, logits[:, 1])),
+        "test_loss": loss_meter.avg
     }
 
-    logger.info("***** Test results *****")
-    for key in sorted(result.keys()):
-        logger.info("  %s = %s", key, str(round(result[key], 4)))
+    logger.info("TEST RESULTS:")
+    for k, v in result.items():
+        logger.info(f"{k}: {round(v,4)}")
+
     return result
 
 
+# ======================= Argument Parser =======================
 def get_parser():
-    parser = argparse.ArgumentParser()
-    # files name and path
-    parser.add_argument("--data_dir", default=None, type=str, required=False,
-                        help="The dir path of data files.")
-    parser.add_argument("--source_train_file_list", default=None, nargs='+', type=str, required=False,
-                        help="The input source training data file list (one or more csv files).")
-    parser.add_argument("--source_valid_file_list", default=None, nargs='+', type=str, required=False,
-                        help="The input source training data file list (one or more csv files).")
-    parser.add_argument("--target_train_file", default=None, type=str, required=False,
-                        help="The input target training data file (a csv file).")
-    parser.add_argument("--target_test_file", default=None, type=str,
-                        help="The input target test data file (a csv file).")
-    parser.add_argument("--output_dir", default=None, type=str, required=False,
-                        help="The output directory where the model predictions and checkpoints will be written.")
 
-    # model
-    parser.add_argument("--model_type", default="bert", type=str,
-                        help="The model architecture to be fine-tuned.")
-    parser.add_argument("--block_size", default=-1, type=int,
-                        help="Optional input sequence length after tokenization."
-                             "The training dataset will be truncated in block of this size for training."
-                             "Default to the model max input length for single sentence inputs (take into account special tokens).")
-    parser.add_argument("--model_name", default="model.bin", type=str,
-                        help="Saved model name.")
-    parser.add_argument("--model_name_or_path", default=None, type=str,
-                        help="The model checkpoint for weights initialization.")
-    parser.add_argument("--config_name", default="", type=str,
-                        help="Optional pretrained config name or path if not the same as model_name_or_path")
-    parser.add_argument("--code_length", default=256, type=int,
-                        help="Optional Code input sequence length after tokenization.")
+    parser = argparse.ArgumentParser(description="MSVD Cross-domain Vulnerability Detector")
 
-    parser.add_argument("--do_train", action='store_true',
-                        help="run training.")
-    parser.add_argument("--do_test", action='store_true',
-                        help="run testing on well-trained model.")
+    # Files
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--source_train_file_list", nargs='+', required=True)
+    parser.add_argument("--source_valid_file_list", nargs='+', required=True)
+    parser.add_argument("--target_train_file", type=str, required=True)
+    parser.add_argument("--target_test_file", type=str, required=True)
+    parser.add_argument('--num_class', type=int, default=2, help='number of output classes')
+    parser.add_argument("--bottleneck_width",type=int,default=256,help="Dimension of the bottleneck layer")
+    parser.add_argument("--output_dir", type=str, required=True)
 
-    # train set
-    parser.add_argument("--train_batch_size", default=4, type=int,
-                        help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--eval_batch_size", default=4, type=int,
-                        help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument("--learning_rate", default=5e-4, type=float,
-                        help="The initial learning rate for Adam.")
-    parser.add_argument("--weight_decay", default=0.0, type=float,
-                        help="Weight deay if we apply some.")
-    parser.add_argument("--adam_epsilon", default=1e-8, type=float,
-                        help="Epsilon for Adam optimizer.")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float,
-                        help="Max gradient norm.")
-    parser.add_argument("--max_steps", default=-1, type=int,
-                        help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
-    parser.add_argument("--warmup_steps", default=0, type=int,
-                        help="Linear warmup over warmup_steps.")
-    parser.add_argument('--seed', type=int, default=42,
-                        help="random seed for initialization")
-    parser.add_argument('--epochs', type=int, default=1,
-                        help="training epochs")
-    parser.add_argument('--early_stop', type=int, default=15, help="Early stopping")
-    parser.add_argument('--num_attention_heads', type=int, default=12,
-                        help="number of attention heads used in CodeBERT")
+    # Model
+    parser.add_argument("--model_type", type=str, default="roberta")
+    parser.add_argument("--model_name", type=str, default="model.bin")
+    parser.add_argument("--model_name_or_path", type=str, default="../codebert")
 
-    # transfer para
-    parser.add_argument('--num_class', type=int, default=2,
-                        help="number of classes.")
-    parser.add_argument('--bottleneck_width', type=int, default=768)
-    parser.add_argument('--transfer_loss_weight', type=float, default=10)
+    # FIXED → tokenizer_name added
+    parser.add_argument("--tokenizer_name", type=str, default="../codebert",
+                        help="Tokenizer name or local path.")
+
+    parser.add_argument("--block_size", type=int, default=512)
+
+    # Train config
+    parser.add_argument("--do_train", action="store_true")
+    parser.add_argument("--do_test", action="store_true")
+    parser.add_argument("--train_batch_size", type=int, default=8)
+    parser.add_argument("--eval_batch_size", type=int, default=8)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay for AdamW optimizer")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--early_stop", type=int, default=10)
+
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--transfer_loss_weight", type=float, default=0.1)
+
     return parser
 
 
+# ======================= Model Loader =======================
 def get_model(args):
+
     args.number_domain = len(args.source_train_file_list)
-    tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name)
+
+    tokenizer = RobertaTokenizer.from_pretrained(
+        args.tokenizer_name,
+        use_fast=False,
+        local_files_only=False
+    )
+
     model = models.MSVD(args)
+
     return model, tokenizer
 
 
+# ======================= Main =======================
 def main():
+
     parser = get_parser()
     args = parser.parse_args()
-    # Setup CUDA, GPU
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.n_gpu = torch.cuda.device_count()
-    # args.n_gpu = 1
-    args.device = device
-    # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO)
-    logger.warning("device: %s, n_gpu: %s", device, args.n_gpu, )
-    # Set seed
-    set_seed(args)
-    model, tokenizer = get_model(args)
-    logger.info("Training/evaluation parameters %s", args)
 
-    # Training
+    # Device Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
+    args.n_gpu = torch.cuda.device_count()
+
+    # Logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        level=logging.INFO
+    )
+
+    logger.info(f"Device: {device}, GPUs: {args.n_gpu}")
+    set_seed(args)
+
+    # Load model
+    model, tokenizer = get_model(args)
+
     if args.do_train:
         train(model, tokenizer, args)
 
     if args.do_test:
-        target_test_inputs, target_test_labels = load_dataset(tokenizer, args.target_test_file, args)
-        checkpoint_prefix = f'checkpoint-best-f1-madv/{args.model_name}'
-        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-        model.load_state_dict(torch.load(output_dir, map_location=args.device))
-        model.to(args.device)
-        test(args, model, target_test_inputs, target_test_labels)
+        x, y = load_dataset(tokenizer, args.target_test_file, args)
+
+        ckpt = os.path.join(args.output_dir, "checkpoint-best-f1-madv", args.model_name)
+        model.load_state_dict(torch.load(ckpt, map_location=args.device))
+
+        test(args, model, x, y)
+
 
 if __name__ == "__main__":
     main()
