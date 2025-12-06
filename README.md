@@ -18,6 +18,7 @@ This is an implementation of the method described in: "multi-source cross-domain
 5) Download the code pre-trained model
    
    Download [CodeBERT](https://huggingface.co/microsoft/codebert-base/tree/main), and move the pre-trained model to `<project root>/code/codebert` folder.
+   or on the root of project type : git clone https://huggingface.co/microsoft/codebert-base
 
    ```
    msvd
